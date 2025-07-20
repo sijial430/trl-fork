@@ -55,8 +55,8 @@ def to_unpaired_preference(examples):
     prompts, completions, labels = [], [], []
     for i in range(len(examples["prompt"])):
         prompt = [{"role": "user", "content": examples["prompt"][i]}]
-        chosen_completion = {"role": "assistant", "content": examples["chosen"][i][-1]["content"]}
-        rejected_completion = {"role": "assistant", "content": examples["rejected"][i][-1]["content"]}
+        chosen_completion = [{"role": "assistant", "content": examples["chosen"][i][-1]["content"]}]
+        rejected_completion = [{"role": "assistant", "content": examples["rejected"][i][-1]["content"]}]
 
         prompts.append(prompt)
         completions.append(chosen_completion)
