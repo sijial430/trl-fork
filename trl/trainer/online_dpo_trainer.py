@@ -18,6 +18,8 @@ import warnings
 from functools import wraps
 from typing import Any, Callable, Optional, Union
 
+import dataclasses
+import json
 import datasets
 import jinja2
 import numpy as np
@@ -231,6 +233,11 @@ class OnlineDPOTrainer(Trainer):
 
         self.max_length = args.max_length
 
+        self.humanline = args.humanline
+        self.humanline_baseline = args.humanline_baseline
+        self.log_epsilon_P = args.log_epsilon_P
+        self.log_epsilon_R = args.log_epsilon_R
+
         self.stats = {
             "objective/kl": [],
             "objective/entropy": [],
@@ -243,6 +250,7 @@ class OnlineDPOTrainer(Trainer):
             "logps/rejected": [],
             "val/contain_eos_token": [],
             "beta": [],
+            "unclamped": [],
         }
         if self.reward_model is not None:
             self.stats["objective/rlhf_reward"] = []
@@ -590,6 +598,9 @@ class OnlineDPOTrainer(Trainer):
                 _, scores, _ = get_reward(
                     self.reward_model, prompt_completion_ids, self.reward_processing_class.pad_token_id, context_length
                 )
+                print("scores")
+                print(scores.shape, scores)
+                print(self.reward_model)
 
                 # Filter completion. Ensure that the sample contains stop_token_id
                 # Completions not passing that filter will receive a lower score.
@@ -606,26 +617,65 @@ class OnlineDPOTrainer(Trainer):
         chosen_indices = batch_range + (~mask * batch_size)
         rejected_indices = batch_range + (mask * batch_size)
 
-        # Build tensor so that the first half is the chosen examples and the second half the rejected examples
-        cr_indices = torch.cat((chosen_indices, rejected_indices), dim=0)  # cr = chosen and rejected
-        cr_logprobs = logprobs[cr_indices]
-        cr_ref_logprobs = ref_logprobs[cr_indices]
+        if self.humanline:
+            chosen_logprobs = logprobs[chosen_indices]
+            rejected_logprobs = logprobs[rejected_indices]
+            chosen_ref_logprobs = ref_logprobs[chosen_indices]
+            rejected_ref_logprobs = ref_logprobs[rejected_indices]
+            
+            padding_mask = ~completion_mask.bool()
+            chosen_padding_mask = padding_mask[chosen_indices]
+            rejected_padding_mask = padding_mask[rejected_indices]
+            chosen_logprobs_masked = chosen_logprobs * ~chosen_padding_mask
+            rejected_logprobs_masked = rejected_logprobs * ~rejected_padding_mask
+            chosen_ref_logprobs_masked = chosen_ref_logprobs * ~chosen_padding_mask
+            rejected_ref_logprobs_masked = rejected_ref_logprobs * ~rejected_padding_mask
+            
+            pi_logratios = chosen_logprobs_masked - rejected_logprobs_masked
+            ref_logratios = chosen_ref_logprobs_masked - rejected_ref_logprobs_masked
+            
+            logits = (pi_logratios - ref_logratios)
+            # print("logits before clipping: {} (shape: {})".format(logits, logits.shape))
+            if self.log_epsilon_P is None:
+                self.log_epsilon_P = -float('inf')
+            if self.log_epsilon_R is None:
+                self.log_epsilon_R = float('inf')
+                
+            unclamped = (self.log_epsilon_P < logits) & (logits < self.log_epsilon_R)
+            unclamped = (unclamped & (logits != 0)).float().sum() / (logits != 0).float().sum()
+            
+            logits = logits.clamp(self.log_epsilon_P, self.log_epsilon_R)
+            # print("logits after clipping: {} (shape: {})".format(logits, logits.shape), "unclamped: {}".format(unclamped))
+            logits = logits.sum(1)
+            
+            chosen_logprobs_sum = chosen_logprobs_masked.sum(1)
+            rejected_logprobs_sum = rejected_logprobs_masked.sum(1)
+            chosen_ref_logprobs_sum = chosen_ref_logprobs_masked.sum(1)
+            rejected_ref_logprobs_sum = rejected_ref_logprobs_masked.sum(1)
+            # import pdb; pdb.set_trace()
+            
+        else:
+            # Build tensor so that the first half is the chosen examples and the second half the rejected examples
+            cr_indices = torch.cat((chosen_indices, rejected_indices), dim=0)  # cr = chosen and rejected
+            cr_logprobs = logprobs[cr_indices]
+            cr_ref_logprobs = ref_logprobs[cr_indices]
 
-        # mask out the padding tokens
-        padding_mask = ~completion_mask.bool()
-        cr_padding_mask = padding_mask[cr_indices]
+            # mask out the padding tokens
+            padding_mask = ~completion_mask.bool()
+            cr_padding_mask = padding_mask[cr_indices]
 
-        cr_logprobs_sum = (cr_logprobs * ~cr_padding_mask).sum(1)
-        cr_ref_logprobs_sum = (cr_ref_logprobs * ~cr_padding_mask).sum(1)
+            cr_logprobs_sum = (cr_logprobs * ~cr_padding_mask).sum(1)
+            cr_ref_logprobs_sum = (cr_ref_logprobs * ~cr_padding_mask).sum(1)
 
-        # Split the chosen and rejected examples
-        chosen_logprobs_sum, rejected_logprobs_sum = torch.split(cr_logprobs_sum, batch_size)
-        chosen_ref_logprobs_sum, rejected_ref_logprobs_sum = torch.split(cr_ref_logprobs_sum, batch_size)
-        pi_logratios = chosen_logprobs_sum - rejected_logprobs_sum
-        ref_logratios = chosen_ref_logprobs_sum - rejected_ref_logprobs_sum
+            # Split the chosen and rejected examples
+            chosen_logprobs_sum, rejected_logprobs_sum = torch.split(cr_logprobs_sum, batch_size)
+            chosen_ref_logprobs_sum, rejected_ref_logprobs_sum = torch.split(cr_ref_logprobs_sum, batch_size)
+            pi_logratios = chosen_logprobs_sum - rejected_logprobs_sum
+            ref_logratios = chosen_ref_logprobs_sum - rejected_ref_logprobs_sum
 
-        logits = pi_logratios - ref_logratios
-
+            logits = pi_logratios - ref_logratios
+            print("logits: {} (shape: {})".format(logits, logits.shape))
+        
         if self.args.loss_type == "sigmoid":
             losses = -F.logsigmoid(self.beta * logits)
         elif self.args.loss_type == "ipo":
@@ -670,6 +720,10 @@ class OnlineDPOTrainer(Trainer):
         accuracy = margin > 0
         self.stats["rewards/accuracies"].append(accuracy.float().mean().item())
         self.stats["beta"].append(self.beta)
+        if self.humanline:
+            self.stats["unclamped"].append(self.accelerator.gather_for_metrics(unclamped).mean().item())
+        else:
+            self.stats["unclamped"].append(1.0)
 
         if (
             self.args.torch_empty_cache_steps is not None
@@ -838,3 +892,35 @@ class OnlineDPOTrainer(Trainer):
             paper_id="2402.04792",
         )
         model_card.save(os.path.join(self.args.output_dir, "README.md"))
+
+    # def _save_checkpoint(self, model, trial):
+    #     # Save model + optimizer states
+    #     super()._save_checkpoint(model, trial)
+
+    #     # Sanitize and save trainer state
+    #     state_dict = dataclasses.asdict(self.state)
+
+    #     def sanitize(obj):
+    #         if isinstance(obj, dict):
+    #             return {k: sanitize(v) for k, v in obj.items()}
+    #         elif isinstance(obj, list):
+    #             return [sanitize(v) for v in obj]
+    #         elif isinstance(obj, torch.Tensor):
+    #             return obj.item() if obj.numel() == 1 else obj.tolist()
+    #         else:
+    #             return obj
+
+    #     sanitized_state_dict = sanitize(state_dict)
+    #     # `TRAINER_STATE_NAME` is defined in `transformers.trainer_callback` since v4.47.
+    #     # For compatibility with earlier versions where the constant lives in
+    #     # `transformers.trainer_utils` (or is absent altogether) we retrieve it lazily
+    #     # using `getattr`, and fall back to the default file name used by the HF
+    #     # trainer when the constant cannot be found.
+    #     trainer_state_name = getattr(
+    #         transformers.trainer_callback,
+    #         "TRAINER_STATE_NAME",
+    #         getattr(transformers.trainer_utils, "TRAINER_STATE_NAME", "trainer_state.json"),
+    #     )
+    #     trainer_state_path = os.path.join(self.args.output_dir, trainer_state_name)
+    #     with open(trainer_state_path, "w") as f:
+    #         json.dump(sanitized_state_dict, f, indent=2, sort_keys=True)
