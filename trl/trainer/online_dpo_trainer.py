@@ -598,9 +598,6 @@ class OnlineDPOTrainer(Trainer):
                 _, scores, _ = get_reward(
                     self.reward_model, prompt_completion_ids, self.reward_processing_class.pad_token_id, context_length
                 )
-                print("scores")
-                print(scores.shape, scores)
-                print(self.reward_model)
 
                 # Filter completion. Ensure that the sample contains stop_token_id
                 # Completions not passing that filter will receive a lower score.
@@ -892,35 +889,3 @@ class OnlineDPOTrainer(Trainer):
             paper_id="2402.04792",
         )
         model_card.save(os.path.join(self.args.output_dir, "README.md"))
-
-    # def _save_checkpoint(self, model, trial):
-    #     # Save model + optimizer states
-    #     super()._save_checkpoint(model, trial)
-
-    #     # Sanitize and save trainer state
-    #     state_dict = dataclasses.asdict(self.state)
-
-    #     def sanitize(obj):
-    #         if isinstance(obj, dict):
-    #             return {k: sanitize(v) for k, v in obj.items()}
-    #         elif isinstance(obj, list):
-    #             return [sanitize(v) for v in obj]
-    #         elif isinstance(obj, torch.Tensor):
-    #             return obj.item() if obj.numel() == 1 else obj.tolist()
-    #         else:
-    #             return obj
-
-    #     sanitized_state_dict = sanitize(state_dict)
-    #     # `TRAINER_STATE_NAME` is defined in `transformers.trainer_callback` since v4.47.
-    #     # For compatibility with earlier versions where the constant lives in
-    #     # `transformers.trainer_utils` (or is absent altogether) we retrieve it lazily
-    #     # using `getattr`, and fall back to the default file name used by the HF
-    #     # trainer when the constant cannot be found.
-    #     trainer_state_name = getattr(
-    #         transformers.trainer_callback,
-    #         "TRAINER_STATE_NAME",
-    #         getattr(transformers.trainer_utils, "TRAINER_STATE_NAME", "trainer_state.json"),
-    #     )
-    #     trainer_state_path = os.path.join(self.args.output_dir, trainer_state_name)
-    #     with open(trainer_state_path, "w") as f:
-    #         json.dump(sanitized_state_dict, f, indent=2, sort_keys=True)
