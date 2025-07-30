@@ -384,3 +384,29 @@ class DPOConfig(TrainingArguments):
             "Comet during evaluation."
         },
     )
+    num_generations: int = field(
+        default=2,
+        metadata={
+            "help": "Number of generations to sample for each prompt."
+        },
+    )
+    
+    # Parameters that control the humanline
+    humanline: Optional[bool] = field(
+        default=False,
+        metadata={
+            "help": "Whether to use humanline"
+        },
+    )
+    log_epsilon_P: Optional[float] = field(
+        default=-1.5,
+        metadata={
+            "help": "humanline lower bound"
+        },
+    )
+    log_epsilon_R: Optional[float] = field(
+        default=1.5,
+        metadata={
+            "help": "humanline upper bound"
+        },
+    )

@@ -353,6 +353,7 @@ class DPOTrainer(Trainer):
             self.ref_model = None
         else:
             self.ref_model = create_reference_model(model)
+            print(f"Reference model created for off-policy training.")
 
         if processing_class is None:
             raise ValueError("processing_class must be specified to tokenize a DPO dataset.")
@@ -364,6 +365,8 @@ class DPOTrainer(Trainer):
                 self.padding_value = processing_class.pad_token_id
             elif hasattr(processing_class, "tokenizer") and processing_class.tokenizer.pad_token_id is not None:
                 self.padding_value = processing_class.tokenizer.pad_token_id
+            elif hasattr(processing_class, "pad_token_id") and processing_class.pad_token_id is None and processing_class.eos_token_id is not None:
+                self.padding_value = processing_class.eos_token_id
             else:
                 raise ValueError(
                     "`padding_value` is not specified in `DPOConfig`, and `pad_token_id` is missing in the "
@@ -389,6 +392,11 @@ class DPOTrainer(Trainer):
         self.truncation_mode = args.truncation_mode
         self.precompute_ref_log_probs = args.precompute_ref_log_probs
         self.use_logits_to_keep = args.use_logits_to_keep
+        self.humanline = args.humanline
+        self.humanline_baseline = args.humanline_baseline
+        self.log_epsilon_P = args.log_epsilon_P
+        self.log_epsilon_R = args.log_epsilon_R
+        self.num_generations = args.num_generations
 
         if args.padding_free:
             if model.config._attn_implementation != "flash_attention_2":
@@ -807,7 +815,7 @@ class DPOTrainer(Trainer):
                     ref_model_output = self.concatenated_forward(self.model, batch)
             else:
                 ref_model_output = self.concatenated_forward(self.ref_model, batch)
-        return ref_model_output["chosen_logps"], ref_model_output["rejected_logps"]
+        return ref_model_output["chosen_logps"], ref_model_output["rejected_logps"], ref_model_output["per_token_chosen_logps"], ref_model_output["per_token_rejected_logps"]
 
     @staticmethod
     def concatenated_inputs(
@@ -885,6 +893,7 @@ class DPOTrainer(Trainer):
         rejected_logps: torch.FloatTensor,
         ref_chosen_logps: torch.FloatTensor,
         ref_rejected_logps: torch.FloatTensor,
+        token_level: bool = False,
     ) -> tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
         """
         Compute the DPO loss for a batch of policy and reference model log probabilities.
@@ -910,6 +919,24 @@ class DPOTrainer(Trainer):
         # Get the log ratios for the chosen and rejected responses
         chosen_logratios = chosen_logps.to(device) - (not self.reference_free) * ref_chosen_logps.to(device)
         rejected_logratios = rejected_logps.to(device) - (not self.reference_free) * ref_rejected_logps.to(device)
+        
+        if self.humanline:
+            assert token_level, "token_level must be True for humanline"
+            
+            def _get_unclamped(logratios):
+                """ Compute fraction of tokens that remain unclamped, ignoring masked (zero) positions. """
+                logratios = logratios.detach()
+                unclamped = ((self.log_epsilon_P < logratios) & (logratios < self.log_epsilon_R) & (logratios != 0))
+                return (unclamped.float().sum() / (logratios != 0).float().sum().clamp(min=1)).clamp(min=0, max=1)
+            
+            chosen_unclamped = _get_unclamped(chosen_logratios)
+            chosen_logratios = chosen_logratios.clamp(min=self.log_epsilon_P, max=self.log_epsilon_R)
+
+            rejected_unclamped = _get_unclamped(rejected_logratios)
+            rejected_logratios = rejected_logratios.clamp(min=self.log_epsilon_P, max=self.log_epsilon_R)
+        else:
+            chosen_unclamped = torch.tensor([1], dtype=chosen_logratios.dtype, device=device)
+            rejected_unclamped = torch.tensor([1], dtype=rejected_logratios.dtype, device=device)
 
         if self.f_divergence_type == FDivergenceType.ALPHA_DIVERGENCE.value:
             # The alpha-divergence formula: (1 - u^-alpha) / alpha
@@ -1064,7 +1091,7 @@ class DPOTrainer(Trainer):
         chosen_rewards = self.beta * (chosen_logps.to(device) - ref_chosen_logps.to(device)).detach()
         rejected_rewards = self.beta * (rejected_logps.to(device) - ref_rejected_logps.to(device)).detach()
 
-        return losses, chosen_rewards, rejected_rewards
+        return losses, chosen_rewards, rejected_rewards, chosen_unclamped, rejected_unclamped
 
     def concatenated_forward(self, model: nn.Module, batch: dict[str, Union[list, torch.LongTensor]]):
         """Run the given model on the given batch of inputs, concatenating the chosen and rejected inputs together.
@@ -1189,7 +1216,7 @@ class DPOTrainer(Trainer):
             )
             per_token_logps_[attention_mask.bool()] = per_token_logps
             per_token_logps = per_token_logps_
-
+        
         all_logps = per_token_logps.sum(-1)
 
         output = {}
@@ -1219,7 +1246,9 @@ class DPOTrainer(Trainer):
             all_logps = all_logps / loss_mask.sum(-1)
 
         output["chosen_logps"] = all_logps[:num_examples]
+        output["per_token_chosen_logps"] = per_token_logps[:num_examples]
         output["rejected_logps"] = all_logps[num_examples:]
+        output["per_token_rejected_logps"] = per_token_logps[num_examples:]
 
         # Compute the mean logits
         if self.padding_free:
@@ -1257,12 +1286,23 @@ class DPOTrainer(Trainer):
         if "ref_chosen_logps" in batch and "ref_rejected_logps" in batch:
             ref_chosen_logps = batch["ref_chosen_logps"]
             ref_rejected_logps = batch["ref_rejected_logps"]
+            per_token_ref_chosen_logps = batch["per_token_ref_chosen_logps"]
+            per_token_ref_rejected_logps = batch["per_token_ref_rejected_logps"]
         else:
-            ref_chosen_logps, ref_rejected_logps = self.compute_ref_log_probs(batch)
+            ref_chosen_logps, ref_rejected_logps, per_token_ref_chosen_logps, per_token_ref_rejected_logps = self.compute_ref_log_probs(batch)
 
-        losses, chosen_rewards, rejected_rewards = self.dpo_loss(
-            model_output["chosen_logps"], model_output["rejected_logps"], ref_chosen_logps, ref_rejected_logps
-        )
+        if self.humanline:
+            losses, per_token_chosen_rewards, per_token_rejected_rewards, per_token_chosen_unclamped, per_token_rejected_unclamped = self.dpo_loss(
+                model_output["per_token_chosen_logps"], model_output["per_token_rejected_logps"], per_token_ref_chosen_logps, per_token_ref_rejected_logps, token_level=True
+            )
+            chosen_rewards = per_token_chosen_rewards.sum(dim=1)
+            rejected_rewards = per_token_rejected_rewards.sum(dim=1)
+            chosen_unclamped = per_token_chosen_unclamped.mean()
+            rejected_unclamped = per_token_rejected_unclamped.mean()
+        else:
+            losses, chosen_rewards, rejected_rewards, chosen_unclamped, rejected_unclamped = self.dpo_loss(
+                model_output["chosen_logps"], model_output["rejected_logps"], ref_chosen_logps, ref_rejected_logps, token_level=False
+            )
         reward_accuracies = (chosen_rewards > rejected_rewards).float()
 
         if self.args.rpo_alpha is not None:
@@ -1301,6 +1341,8 @@ class DPOTrainer(Trainer):
             metrics[f"{prefix}aux_loss"] = (
                 self.accelerator.gather_for_metrics(model_output["aux_loss"]).detach().mean().item()
             )
+        metrics[f"{prefix}chosen_unclamped"] = chosen_unclamped.mean().item()
+        metrics[f"{prefix}rejected_unclamped"] = rejected_unclamped.mean().item()
 
         return losses.mean(), metrics
 
