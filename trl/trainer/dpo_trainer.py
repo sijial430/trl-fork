@@ -393,7 +393,6 @@ class DPOTrainer(Trainer):
         self.precompute_ref_log_probs = args.precompute_ref_log_probs
         self.use_logits_to_keep = args.use_logits_to_keep
         self.humanline = args.humanline
-        self.humanline_baseline = args.humanline_baseline
         self.log_epsilon_P = args.log_epsilon_P
         self.log_epsilon_R = args.log_epsilon_R
         self.num_generations = args.num_generations
