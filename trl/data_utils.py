@@ -92,6 +92,10 @@ def apply_chat_template(
         raise KeyError(f"Invalid keys in the example: {example_keys}")
 
     # Apply the chat template to the whole conversation
+    if tokenizer.chat_template is None:
+        tokenizer.chat_template = "{% set loop_messages = messages %}{% for message in loop_messages %}{% set content = '<|start_header_id|>' + message['role'] + '<|end_header_id|>\n\n'+ message['content'] | trim + '<|eot_id|>' %}{% if loop.index2 == 0 %}{% set content = bos_token + content %}{% endif %}{{ content }}{% endfor %}{% if add_generation_prompt %}{{ '<|start_header_id|>assistant<|end_header_id|>\n\n' }}{% endif %}"
+
+    assert tokenizer.chat_template is not None
     if "messages" in example:
         messages = tokenizer.apply_chat_template(example["messages"], tools=tools, tokenize=False)
 
