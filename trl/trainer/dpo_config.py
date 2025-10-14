@@ -102,6 +102,8 @@ class DPOConfig(TrainingArguments):
         learning_rate (`float`, *optional*, defaults to `1e-6`):
             Initial learning rate for [`AdamW`] optimizer. The default value replaces that of
             [`~transformers.TrainingArguments`].
+        warmup_ratio (`float`, *optional*, defaults to `0.1`):
+            Warmup ratio for the learning rate scheduler.
         loss_type (`str`, *optional*, defaults to `"sigmoid"`):
             Type of loss to use. Possible values are:
 
@@ -279,6 +281,12 @@ class DPOConfig(TrainingArguments):
         metadata={
             "help": "Initial learning rate for `AdamW` optimizer. The default value replaces that of "
             "`transformers.TrainingArguments`."
+        },
+    )
+    warmup_ratio: float = field(
+        default=0.1,
+        metadata={
+            "help": "Warmup ratio for the learning rate scheduler."
         },
     )
     loss_type: str = field(

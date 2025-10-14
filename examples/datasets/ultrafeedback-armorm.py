@@ -68,6 +68,23 @@ def to_unpaired_preference(examples):
     return {"prompt": prompts, "completion": completions, "label": labels}
 
 
+def to_unpaired_preference_text_only(examples):
+    prompts, completions, labels = [], [], []
+    for i in range(len(examples["prompt"])):
+        prompt = examples["prompt"][i]
+        chosen_completion = examples["chosen"][i][-1]["content"]
+        rejected_completion = examples["rejected"][i][-1]["content"]
+
+        prompts.append(prompt)
+        completions.append(chosen_completion)
+        labels.append(True)
+
+        prompts.append(prompt)
+        completions.append(rejected_completion)
+        labels.append(False)
+    return {"prompt": prompts, "completion": completions, "label": labels}
+
+
 model_card = ModelCard("""
 ---
 tags: [trl]
@@ -100,7 +117,7 @@ if __name__ == "__main__":
 
     dataset = load_dataset("princeton-nlp/llama3-ultrafeedback-armorm", split="train")    
     dataset = dataset.map(
-        to_unpaired_preference,
+        to_unpaired_preference_text_only,
         remove_columns=["prompt_id", "prompt", "chosen", "rejected", "all_generated_responses", "all_rm_scores"],
         num_proc=script_args.dataset_num_proc,
         batched=True,
@@ -112,3 +129,7 @@ if __name__ == "__main__":
         dataset.push_to_hub(script_args.repo_id)
         model_card.push_to_hub(script_args.repo_id, repo_type="dataset")
         print(f"Dataset pushed to {script_args.repo_id}.")
+        
+        # reload the dataset
+        dataset = load_dataset(script_args.repo_id)
+        print(f"Dataset reloaded from {script_args.repo_id}. Cache updated.")

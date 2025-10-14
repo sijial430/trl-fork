@@ -335,6 +335,7 @@ class GRPOConfig(TrainingArguments):
 
     # Parameters that control the vLLM server (only used when `vllm_mode` is `"server"`)
     vllm_server_host: str = field(
+        # default="127.0.0.1",
         default="0.0.0.0",
         metadata={"help": "Host of the vLLM server to connect to."},
     )
@@ -513,6 +514,18 @@ class GRPOConfig(TrainingArguments):
         metadata={
             "help": "humanline upper bound"
         },
+    )
+    # Parameters that control remote server endpoints for generation and reward scoring
+    remote_generate_url: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "If specified, generation requests are sent to this HTTP endpoint instead of using local or vLLM generation. The endpoint should accept POST requests matching the schema of src.open_r1.serve '/generate/'."
+        },
+    )
+    remote_score_url: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "If specified, reward scoring requests are sent in batch to this HTTP endpoint (e.g. /score/ from src.open_r1.serve). When set, a wrapper reward function will be automatically created to call this endpoint."}
     )
     def __post_init__(self):
         super().__post_init__()

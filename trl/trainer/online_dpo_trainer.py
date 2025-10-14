@@ -17,6 +17,7 @@ import textwrap
 import warnings
 from functools import wraps
 from typing import Any, Callable, Optional, Union
+import requests
 
 import dataclasses
 import json
@@ -232,11 +233,12 @@ class OnlineDPOTrainer(Trainer):
             data_collator = DPODataCollatorWithPadding(pad_token_id=processing_class.pad_token_id)
 
         self.max_length = args.max_length
-
+        self.num_generations = args.num_generations
         self.humanline = args.humanline
-        self.humanline_baseline = args.humanline_baseline
         self.log_epsilon_P = args.log_epsilon_P
         self.log_epsilon_R = args.log_epsilon_R
+        self.sync_reference = args.sync_reference
+        self.sync_reference_steps = args.sync_reference_steps
 
         self.stats = {
             "objective/kl": [],
@@ -264,11 +266,11 @@ class OnlineDPOTrainer(Trainer):
                     "`pip install vllm` to use it."
                 )
             self.generation_config = SamplingParams(
-                n=2,  # 2 generations per prompt
+                n=args.num_generations,  # N generations per prompt
                 max_tokens=args.max_new_tokens,
                 temperature=args.temperature,
-                top_k=50,
-                top_p=1.0,
+                top_k=args.top_k,
+                top_p=args.top_p,
                 detokenize=False,  # to avoid vllm to decode (we don't need it)
             )
             # vLLM dynamically adjusts the size of the key-value cache based on available GPU memory at instantiation.
@@ -276,10 +278,11 @@ class OnlineDPOTrainer(Trainer):
             # However, at this stage, the optimizer's weights are not yet loaded onto the GPU; they will be loaded
             # after the first optimizer step and remain in GPU memory throughout training. So we must reserve enough
             # space for them. Setting gpu_memory_utilization to 0.55 seems to work well in practice.
+            print("here is good: gpu_memory_utilization: {}".format(args.gpu_memory_utilization))
             self.llm = LLM(
                 model=model.name_or_path,
                 gpu_memory_utilization=args.gpu_memory_utilization,
-                dtype=torch.float32,
+                dtype=torch.bfloat16,
                 # When release by vLLM, we would be able to distribute the model on multiple GPUs
                 # See https://github.com/vllm-project/vllm/pull/12071
                 # tensor_parallel_size=torch.cuda.device_count(),
@@ -287,10 +290,11 @@ class OnlineDPOTrainer(Trainer):
             )
         else:
             self.generation_config = GenerationConfig(
+                n=args.num_generations,
                 max_new_tokens=args.max_new_tokens,
                 temperature=args.temperature,
-                top_k=50,
-                top_p=1.0,
+                top_k=args.top_k,
+                top_p=args.top_p,
                 do_sample=True,
                 use_cache=False if args.gradient_checkpointing else True,
             )
@@ -448,8 +452,8 @@ class OnlineDPOTrainer(Trainer):
         else:
             outputs = self.llm.generate(prompts, self.generation_config, use_tqdm=False)
 
-        completion_ids = [list(output.outputs[i].token_ids) for i in range(2) for output in outputs]
-        prompt_ids = [list(output.prompt_token_ids) for _ in range(2) for output in outputs]
+        completion_ids = [list(output.outputs[i].token_ids) for i in range(self.num_generations) for output in outputs]
+        prompt_ids = [list(output.prompt_token_ids) for _ in range(self.num_generations) for output in outputs]
 
         # Create mask and pad the prompt and completion
         max_prompt_length = max(len(ids) for ids in prompt_ids)
@@ -482,10 +486,10 @@ class OnlineDPOTrainer(Trainer):
         inputs = [self.tokenize_row(x, self.is_encoder_decoder, self.processing_class) for x in inputs]
         inputs = self.data_collator(inputs)
 
-        # Sample 2 completions per prompt of size `max_new_tokens` from the model
+        # Sample N completions per prompt of size `max_new_tokens` from the model
         inputs = self._prepare_inputs(inputs)
-        prompt_ids = inputs["prompt_input_ids"].repeat(2, 1)
-        prompt_mask = inputs["prompt_attention_mask"].repeat(2, 1)
+        prompt_ids = inputs["prompt_input_ids"].repeat(self.num_generations, 1)
+        prompt_mask = inputs["prompt_attention_mask"].repeat(self.num_generations, 1)
         with unwrap_model_for_generation(
             model, self.accelerator, gather_deepspeed3_params=self.args.ds3_gather_for_generation
         ) as unwrapped_model:
@@ -499,6 +503,31 @@ class OnlineDPOTrainer(Trainer):
         completion_ids, completion_mask = truncate_right(completion_ids, eos_token_id, pad_token_id)
 
         return prompt_ids, prompt_mask, completion_ids, completion_mask
+
+    def _sync_reference_model(self):
+        """
+        Sync the reference model with the current policy model state.
+        This is crucial for Online DPO to prevent the policy from drifting too far from the reference.
+        """
+        if not self.sync_reference:
+            return
+            
+        if self.ref_model is not None:
+            logger.info(f"Syncing reference model at step {self.state.global_step}")
+            
+            # Copy policy model state to reference model
+            self.ref_model.load_state_dict(self.model.state_dict())
+            self.ref_model.eval()
+            
+            # Ensure reference model gradients are disabled
+            for param in self.ref_model.parameters():
+                param.requires_grad = False
+                
+        elif hasattr(self.model, 'peft_config'):
+            # For PEFT models, the reference is just the base model, so no syncing needed
+            logger.info(f"PEFT model detected - reference syncing not needed at step {self.state.global_step}")
+        else:
+            logger.warning("sync_reference=True but no reference model found and not using PEFT")
 
     def _forward(self, model, prompt_ids, prompt_mask, completion_ids, completion_mask):
         # Get the number of tokens to truncate from prompt
@@ -563,14 +592,21 @@ class OnlineDPOTrainer(Trainer):
                 prompts = [template.render(messages=prompt) for prompt in prompts]
                 completions = [template.render(messages=completion) for completion in completions]
 
-            ranks_of_first_completion = self.judge.judge(
-                prompts, list(zip(completions[:batch_size], completions[batch_size:]))
-            )
+            if self.args.num_generations == 2:
+                ranks_of_first_completion, completions = self.judge.judge(
+                    prompts, list(zip(completions[:batch_size], completions[batch_size:]))
+                )
+            else:
+                # for num_generations > 2, we need to judge the completions in chunks of num_generations
+                ranks_of_first_completion, completions = self.judge.judge(
+                    prompts, [completions[i:i+self.num_generations] for i in range(0, len(completions), self.num_generations)]
+                )
 
             # convert ranks to a True/False mask:
             # when rank == 0, it means the first completion is the best
             # when rank == 1, it means the second completion is the best
             mask = torch.tensor([rank == 0 for rank in ranks_of_first_completion], device=device)
+            # import pdb; pdb.set_trace()
         else:
             # The reward model may not have the same chat template or tokenizer as the model, so we need to use the
             # raw data (string), apply the chat template (if needed), and tokenize it with the reward processing class.
@@ -599,10 +635,10 @@ class OnlineDPOTrainer(Trainer):
                     self.reward_model, prompt_completion_ids, self.reward_processing_class.pad_token_id, context_length
                 )
 
-                # Filter completion. Ensure that the sample contains stop_token_id
-                # Completions not passing that filter will receive a lower score.
-                if self.args.missing_eos_penalty is not None:
-                    scores[~contain_eos_token] -= self.args.missing_eos_penalty
+            # Filter completion. Ensure that the sample contains stop_token_id
+            # Completions not passing that filter will receive a lower score.
+            if self.args.missing_eos_penalty is not None:
+                scores[~contain_eos_token] -= self.args.missing_eos_penalty
 
             # Split the scores in 2 (the prompts of the first half are the same as the second half)
             first_half, second_half = scores.split(batch_size)
@@ -614,64 +650,57 @@ class OnlineDPOTrainer(Trainer):
         chosen_indices = batch_range + (~mask * batch_size)
         rejected_indices = batch_range + (mask * batch_size)
 
+        # Extract chosen and rejected tensors with common padding mask
+        padding_mask = ~completion_mask.bool()
+        
+        def _extract_and_mask(tensor, padding_mask, indices):
+            """Extract tensor by indices and apply padding mask."""
+            return tensor[indices] * ~padding_mask[indices]
+
+        chosen_logprobs_masked = _extract_and_mask(logprobs, padding_mask, chosen_indices)
+        rejected_logprobs_masked = _extract_and_mask(logprobs, padding_mask, rejected_indices)
+        chosen_ref_logprobs_masked = _extract_and_mask(ref_logprobs, padding_mask, chosen_indices)
+        rejected_ref_logprobs_masked = _extract_and_mask(ref_logprobs, padding_mask, rejected_indices)
+        
+        # Compute sequence-level sums (used by both branches)
+        chosen_logprobs_sum = chosen_logprobs_masked.sum(1)
+        rejected_logprobs_sum = rejected_logprobs_masked.sum(1)
+        chosen_ref_logprobs_sum = chosen_ref_logprobs_masked.sum(1)
+        rejected_ref_logprobs_sum = rejected_ref_logprobs_masked.sum(1)
+
         if self.humanline:
-            chosen_logprobs = logprobs[chosen_indices]
-            rejected_logprobs = logprobs[rejected_indices]
-            chosen_ref_logprobs = ref_logprobs[chosen_indices]
-            rejected_ref_logprobs = ref_logprobs[rejected_indices]
+            # Compute individual logratios (policy - reference) for chosen and rejected
+            chosen_logratios = chosen_logprobs_masked - chosen_ref_logprobs_masked
+            rejected_logratios = rejected_logprobs_masked - rejected_ref_logprobs_masked
             
-            padding_mask = ~completion_mask.bool()
-            chosen_padding_mask = padding_mask[chosen_indices]
-            rejected_padding_mask = padding_mask[rejected_indices]
-            chosen_logprobs_masked = chosen_logprobs * ~chosen_padding_mask
-            rejected_logprobs_masked = rejected_logprobs * ~rejected_padding_mask
-            chosen_ref_logprobs_masked = chosen_ref_logprobs * ~chosen_padding_mask
-            rejected_ref_logprobs_masked = rejected_ref_logprobs * ~rejected_padding_mask
-            
-            pi_logratios = chosen_logprobs_masked - rejected_logprobs_masked
-            ref_logratios = chosen_ref_logprobs_masked - rejected_ref_logprobs_masked
-            
-            logits = (pi_logratios - ref_logratios)
-            # print("logits before clipping: {} (shape: {})".format(logits, logits.shape))
+            # Set default epsilon values if not provided
             if self.log_epsilon_P is None:
                 self.log_epsilon_P = -float('inf')
             if self.log_epsilon_R is None:
                 self.log_epsilon_R = float('inf')
                 
-            unclamped = (self.log_epsilon_P < logits) & (logits < self.log_epsilon_R)
-            unclamped = (unclamped & (logits != 0)).float().sum() / (logits != 0).float().sum()
+            # Compute unclamped fraction using individual logratios
+            def _get_unclamped(logratios):
+                """ Compute fraction of tokens that remain unclamped, ignoring masked (zero) positions. """
+                unclamped = ((self.log_epsilon_P < logratios) & (logratios < self.log_epsilon_R) & (logratios != 0))
+                return (unclamped.float().sum() / (logratios != 0).float().sum().clamp(min=1)).clamp(min=0, max=1)
             
-            logits = logits.clamp(self.log_epsilon_P, self.log_epsilon_R)
-            # print("logits after clipping: {} (shape: {})".format(logits, logits.shape), "unclamped: {}".format(unclamped))
-            logits = logits.sum(1)
+            chosen_unclamped = _get_unclamped(chosen_logratios)
+            rejected_unclamped = _get_unclamped(rejected_logratios)
+            unclamped = (chosen_unclamped + rejected_unclamped) / 2  # Average unclamped fraction
             
-            chosen_logprobs_sum = chosen_logprobs_masked.sum(1)
-            rejected_logprobs_sum = rejected_logprobs_masked.sum(1)
-            chosen_ref_logprobs_sum = chosen_ref_logprobs_masked.sum(1)
-            rejected_ref_logprobs_sum = rejected_ref_logprobs_masked.sum(1)
-            # import pdb; pdb.set_trace()
+            # Clamp individual logratios separately, then compute difference
+            chosen_logratios_clamped = chosen_logratios.clamp(self.log_epsilon_P, self.log_epsilon_R)
+            rejected_logratios_clamped = rejected_logratios.clamp(self.log_epsilon_P, self.log_epsilon_R)
+            
+            # Compute logits as difference of clamped logratios, then sum across tokens
+            logits = (chosen_logratios_clamped - rejected_logratios_clamped).sum(1)
             
         else:
-            # Build tensor so that the first half is the chosen examples and the second half the rejected examples
-            cr_indices = torch.cat((chosen_indices, rejected_indices), dim=0)  # cr = chosen and rejected
-            cr_logprobs = logprobs[cr_indices]
-            cr_ref_logprobs = ref_logprobs[cr_indices]
-
-            # mask out the padding tokens
-            padding_mask = ~completion_mask.bool()
-            cr_padding_mask = padding_mask[cr_indices]
-
-            cr_logprobs_sum = (cr_logprobs * ~cr_padding_mask).sum(1)
-            cr_ref_logprobs_sum = (cr_ref_logprobs * ~cr_padding_mask).sum(1)
-
-            # Split the chosen and rejected examples
-            chosen_logprobs_sum, rejected_logprobs_sum = torch.split(cr_logprobs_sum, batch_size)
-            chosen_ref_logprobs_sum, rejected_ref_logprobs_sum = torch.split(cr_ref_logprobs_sum, batch_size)
+            # Standard DPO: sequence-level logratios
             pi_logratios = chosen_logprobs_sum - rejected_logprobs_sum
             ref_logratios = chosen_ref_logprobs_sum - rejected_ref_logprobs_sum
-
             logits = pi_logratios - ref_logratios
-            print("logits: {} (shape: {})".format(logits, logits.shape))
         
         if self.args.loss_type == "sigmoid":
             losses = -F.logsigmoid(self.beta * logits)
@@ -681,42 +710,52 @@ class OnlineDPOTrainer(Trainer):
             raise NotImplementedError(f"invalid loss type {self.loss_type}")
 
         loss = losses.mean()
-
-        # Log everything
+        
+        # Helper function to log gathered metrics
+        def _log_metric(key, tensor, gather=True):
+            if gather:
+                value = self.accelerator.gather_for_metrics(tensor).mean().item()
+            else:
+                value = tensor.float().mean().item() if tensor.dtype != torch.float32 else tensor.mean().item()
+            self.stats[key].append(value)
+        
+        # Log metrics
         if self.reward_model is not None:
             scores_margin = scores[chosen_indices] - scores[rejected_indices]
-            self.stats["objective/scores_margin"].append(
-                self.accelerator.gather_for_metrics(scores_margin.mean()).mean().item()
-            )
-            self.stats["objective/scores"].append(self.accelerator.gather_for_metrics(scores.mean()).mean().item())
-        self.stats["val/contain_eos_token"].append(contain_eos_token.float().mean().item())
-        self.stats["logps/chosen"].append(self.accelerator.gather_for_metrics(chosen_logprobs_sum).mean().item())
-        self.stats["logps/rejected"].append(self.accelerator.gather_for_metrics(rejected_logprobs_sum).mean().item())
+            _log_metric("objective/scores_margin", scores_margin.mean())
+            _log_metric("objective/scores", scores.mean())
+        
+        _log_metric("val/contain_eos_token", contain_eos_token, gather=False)
+        _log_metric("logps/chosen", chosen_logprobs_sum)
+        _log_metric("logps/rejected", rejected_logprobs_sum)
 
+        # Compute and log additional metrics
         kl = logprobs - ref_logprobs
-        mean_kl = kl.sum(1).mean()
-        self.stats["objective/kl"].append(self.accelerator.gather_for_metrics(mean_kl).mean().item())
+        _log_metric("objective/kl", kl.sum(1).mean())
+        
         non_score_reward = (-self.beta * kl).sum(1)
-        mean_non_score_reward = non_score_reward.mean()
-        self.stats["objective/non_score_reward"].append(
-            self.accelerator.gather_for_metrics(mean_non_score_reward).mean().item()
-        )
+        _log_metric("objective/non_score_reward", non_score_reward.mean())
+        
         if self.reward_model is not None:
             rlhf_reward = scores + non_score_reward
-            self.stats["objective/rlhf_reward"].append(self.accelerator.gather_for_metrics(rlhf_reward).mean().item())
-        mean_entropy = -logprobs.sum(1).mean()
-        self.stats["objective/entropy"].append(self.accelerator.gather_for_metrics(mean_entropy).mean().item())
+            _log_metric("objective/rlhf_reward", rlhf_reward)
+        
+        _log_metric("objective/entropy", -logprobs.sum(1).mean())
+        
+        # Compute rewards and related metrics
         chosen_rewards = self.beta * (chosen_logprobs_sum - chosen_ref_logprobs_sum)
-        gathered_chosen_rewards = self.accelerator.gather_for_metrics(chosen_rewards)
-        self.stats["rewards/chosen"].append(gathered_chosen_rewards.mean().item())
         rejected_rewards = self.beta * (rejected_logprobs_sum - rejected_ref_logprobs_sum)
+        gathered_chosen_rewards = self.accelerator.gather_for_metrics(chosen_rewards)
         gathered_rejected_rewards = self.accelerator.gather_for_metrics(rejected_rewards)
+        
+        self.stats["rewards/chosen"].append(gathered_chosen_rewards.mean().item())
         self.stats["rewards/rejected"].append(gathered_rejected_rewards.mean().item())
+        
         margin = gathered_chosen_rewards - gathered_rejected_rewards
         self.stats["rewards/margins"].append(margin.mean().item())
-        accuracy = margin > 0
-        self.stats["rewards/accuracies"].append(accuracy.float().mean().item())
+        self.stats["rewards/accuracies"].append((margin > 0).float().mean().item())
         self.stats["beta"].append(self.beta)
+        
         if self.humanline:
             self.stats["unclamped"].append(self.accelerator.gather_for_metrics(unclamped).mean().item())
         else:
@@ -742,6 +781,31 @@ class OnlineDPOTrainer(Trainer):
                 scaled_loss.backward()
         else:
             self.accelerator.backward(loss, **kwargs)
+
+        if self.args.max_grad_norm is not None:
+            # pre-clip (no clipping; also handles unscaling under AMP)
+            try:
+                pre = self.accelerator.clip_grad_norm_(self.model.parameters(), float("inf"))
+                self.accelerator.print(f">> pre-clipping grad_norm: {pre:.4f}")
+
+                # clip
+                self.accelerator.print(f"Clipping grad norm to {self.args.max_grad_norm}")
+                self.accelerator.clip_grad_norm_(self.model.parameters(), self.args.max_grad_norm)
+
+                # post-clip: measure again without changing grads
+                post = self.accelerator.clip_grad_norm_(self.model.parameters(), float("inf"))
+                self.accelerator.print(f">> post-clipping grad_norm: {post:.4f}")
+            except Exception as e:
+                self.accelerator.print(f">> error: {e}")
+                import pdb; pdb.set_trace()
+        else:
+            self.accelerator.print("Default to no clipping grad norm.")
+
+        # Sync reference model at specified intervals
+        if (self.sync_reference and 
+            self.state.global_step % self.sync_reference_steps == 0 and
+            self.state.global_step > 0):  # Don't sync at step 0
+            self._sync_reference_model()
 
         return loss.detach() / self.args.gradient_accumulation_steps
 

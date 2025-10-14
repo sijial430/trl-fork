@@ -50,6 +50,8 @@ from transformers.models.auto.modeling_auto import MODEL_FOR_VISION_2_SEQ_MAPPIN
 from transformers.trainer_callback import TrainerCallback
 from transformers.trainer_utils import EvalLoopOutput
 from transformers.utils import is_peft_available, is_torch_xpu_available
+from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
+import deepspeed
 
 from ..data_utils import maybe_apply_chat_template, maybe_extract_prompt
 from ..models import create_reference_model, prepare_deepspeed
@@ -78,6 +80,26 @@ if is_peft_available():
 
 if is_wandb_available():
     import wandb
+
+
+def _build_reference_model(model, base_ckpt: str, init_kwargs: dict, ds_config: dict):
+    """Return a frozen reference model sharing ZeRO‑3 partitioning with *policy_model*."""
+    if is_deepspeed_zero3_enabled():
+        with deepspeed.zero.Init(module_cls=AutoModelForCausalLM, config_dict_or_path=ds_config):
+            ref = AutoModelForCausalLM.from_pretrained(base_ckpt, **init_kwargs)
+    else:
+        # fall back to lightweight deepcopy
+        ref = create_reference_model(model)
+    for p in ref.parameters():
+        p.requires_grad_(False)
+    return ref
+
+
+def _match_dtype_device(src: nn.Module, dst: nn.Module):
+    """Ensure dtype & device match between policy and reference"""
+    dtype = next(src.parameters()).dtype
+    device = next(src.parameters()).device
+    return dst.to(device=device, dtype=dtype)
 
 
 @dataclass
@@ -352,8 +374,17 @@ class DPOTrainer(Trainer):
             # The `model` with adapters turned off will be used as the reference model
             self.ref_model = None
         else:
+            # # Build reference model using new helper to handle ZeRO‑3 & other cases robustly   
+            # base_ckpt = model.config._name_or_path
+            # if base_ckpt is None:
+            #     raise ValueError("Cannot build reference model: policy model does not expose its _name_or_path")
+            # self.ref_model = _build_reference_model(model, base_ckpt, model_init_kwargs, args.deepspeed)
+
+            # # Guarantee dtype / device parity with policy
+            # self.ref_model = _match_dtype_device(model, self.ref_model)
+            # self.ref_model.eval()
             self.ref_model = create_reference_model(model)
-            print(f"Reference model created for off-policy training.")
+            print("Reference model created for off‑policy training (ZeRO‑aware).")
 
         if processing_class is None:
             raise ValueError("processing_class must be specified to tokenize a DPO dataset.")
@@ -949,11 +980,23 @@ class DPOTrainer(Trainer):
                 alpha_coef = float(self.f_divergence_params[FDivergenceConstants.ALPHA_DIVERGENCE_COEF_KEY])
             logits = (cap_exp(rejected_logratios * -alpha_coef) - cap_exp(chosen_logratios * -alpha_coef)) / alpha_coef
         else:
-            logratios = chosen_logps - rejected_logps
-            if self.reference_free:
-                ref_logratios = torch.tensor([0], dtype=logratios.dtype, device=logratios.device)
+            # For humanline with token-level, use the clamped logratios (already computed and summed over tokens)
+            # For non-token-level, compute logratios normally
+            if self.humanline and token_level:
+                # chosen_logratios and rejected_logratios are already clamped per-token values
+                # Sum them to get the sequence-level logratios
+                logratios = chosen_logratios.sum(dim=1) - rejected_logratios.sum(dim=1)
+                if self.reference_free:
+                    ref_logratios = torch.tensor([0], dtype=logratios.dtype, device=logratios.device)
+                else:
+                    # For reference, we don't need clamping, just sum the per-token values
+                    ref_logratios = ref_chosen_logps.sum(dim=1) - ref_rejected_logps.sum(dim=1)
             else:
-                ref_logratios = ref_chosen_logps - ref_rejected_logps
+                logratios = chosen_logps - rejected_logps
+                if self.reference_free:
+                    ref_logratios = torch.tensor([0], dtype=logratios.dtype, device=logratios.device)
+                else:
+                    ref_logratios = ref_chosen_logps - ref_rejected_logps
 
             logratios = logratios.to(self.accelerator.device)
             ref_logratios = ref_logratios.to(self.accelerator.device)
@@ -1087,8 +1130,13 @@ class DPOTrainer(Trainer):
                 "'nca_pair', 'robust', 'bco_pair', 'sppo_hard', 'aot', 'aot_pair', 'discopop', 'apo_zero', 'apo_down']"
             )
 
-        chosen_rewards = self.beta * (chosen_logps.to(device) - ref_chosen_logps.to(device)).detach()
-        rejected_rewards = self.beta * (rejected_logps.to(device) - ref_rejected_logps.to(device)).detach()
+        # For humanline, use the clamped logratios for reward computation
+        if self.humanline:
+            chosen_rewards = self.beta * chosen_logratios.detach()
+            rejected_rewards = self.beta * rejected_logratios.detach()
+        else:
+            chosen_rewards = self.beta * (chosen_logps.to(device) - ref_chosen_logps.to(device)).detach()
+            rejected_rewards = self.beta * (rejected_logps.to(device) - ref_rejected_logps.to(device)).detach()
 
         return losses, chosen_rewards, rejected_rewards, chosen_unclamped, rejected_unclamped
 
@@ -1363,6 +1411,10 @@ class DPOTrainer(Trainer):
         loss = loss.to(self.args.device)
         # force log the metrics
         self.store_metrics(metrics, train_eval="train")
+
+        if self.accelerator.is_main_process:
+            print(f"loss: {loss.item()}")
+            print(f"metrics: {metrics}")
 
         if return_outputs:
             return loss, metrics

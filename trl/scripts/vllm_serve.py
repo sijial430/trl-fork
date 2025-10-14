@@ -21,9 +21,14 @@ from dataclasses import dataclass, field
 from itertools import chain
 from multiprocessing import Pipe, Process
 from multiprocessing.connection import Connection
-from typing import Optional
+from typing import Optional, Any, List
 
 import torch
+from transformers import (
+    AutoModelForSequenceClassification,
+    AutoTokenizer,
+    BitsAndBytesConfig,
+)
 
 from trl import TrlParser
 from trl.import_utils import (
@@ -267,6 +272,18 @@ class ScriptArguments:
         },
     )
 
+    # ------------------------------------------------------------------
+    # Reward-model specific options
+    # ------------------------------------------------------------------
+    reward_model: bool = field(
+        default=False,
+        metadata={"help": "If set, run in reward-model mode exposing /score/ endpoint instead of generation."},
+    )
+    load_in_4bit: bool = field(
+        default=False,
+        metadata={"help": "Load reward model in 4-bit quantised mode (only used when --reward_model is set)."},
+    )
+
 
 def llm_worker(
     script_args: ScriptArguments, data_parallel_rank: int, master_port: int, connection: Connection
@@ -332,7 +349,135 @@ def chunk_list(lst: list, n: int) -> list[list]:
     return [lst[i * k + min(i, r) : (i + 1) * k + min(i + 1, r)] for i in range(n)]
 
 
+# ============================================================================
+# Reward-model serving utilities (mirrors open_r1/serve_rm.py)
+# ============================================================================
+
+
+def _load_reward_model(model_id: str, load_in_4bit: bool):
+    """Load a sequence-classification reward model, optionally in 4-bit."""
+
+    print(f"[vllm_serve] Loading reward model {model_id} (4-bit={load_in_4bit})…", flush=True)
+
+    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+
+    if load_in_4bit:
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+        )
+        model = AutoModelForSequenceClassification.from_pretrained(
+            model_id,
+            trust_remote_code=True,
+            quantization_config=bnb_config,
+            device_map={"": 0},
+        )
+    else:
+        model = AutoModelForSequenceClassification.from_pretrained(
+            model_id,
+            trust_remote_code=True,
+            torch_dtype=torch.bfloat16,
+            device_map={"": 0},
+        )
+
+    model.eval()
+    print("[vllm_serve] Reward model loaded – ready to serve requests", flush=True)
+    return tokenizer, model
+
+
+def _build_conversation(prompt: Any, completion: Any):
+    """Return a list of chat messages compatible with `apply_chat_template`."""
+
+    if isinstance(prompt, list):
+        # Already in chat-style format; append completion message.
+        if isinstance(completion, list):
+            return prompt + completion
+        return prompt + [{"role": "assistant", "content": completion}]
+    else:
+        return [
+            {"role": "user", "content": prompt},
+            {"role": "assistant", "content": completion},
+        ]
+
+
+def _run_reward_server(script_args: "ScriptArguments"):
+    """Launch a FastAPI server exposing /health/ and /score/ for reward scoring."""
+
+    if not is_fastapi_available():
+        raise ImportError("FastAPI is required to run the reward-model server. Please install it via `pip install fastapi`.")
+
+    if not is_pydantic_available():
+        raise ImportError("Pydantic is required to run the reward-model server. Please install it via `pip install pydantic`.")
+
+    if not is_uvicorn_available():
+        raise ImportError("Uvicorn is required to run the reward-model server. Please install it via `pip install uvicorn`.")
+
+    # Honour offline mode by default – replicate behaviour of serve_rm.py
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+
+    tokenizer, model = _load_reward_model(script_args.model, script_args.load_in_4bit)
+
+    app = FastAPI()
+
+    # ----------------------------------------------------------------------------------
+    # Schemas
+    # ----------------------------------------------------------------------------------
+
+    class ScoreRequest(BaseModel):
+        prompts: List[Any]
+        completions: List[Any]
+
+    class ScoreResponse(BaseModel):
+        scores: List[float]
+
+    # ----------------------------------------------------------------------------------
+    # Endpoints
+    # ----------------------------------------------------------------------------------
+
+    @app.get("/health/")
+    async def health():
+        return {"status": "ok"}
+
+    @app.post("/score/", response_model=ScoreResponse)
+    async def score(req: ScoreRequest):
+        assert len(req.prompts) == len(req.completions), "prompts and completions must be same length"
+
+        conversations = [_build_conversation(p, c) for p, c in zip(req.prompts, req.completions)]
+
+        # Convert to plain strings via the tokenizer's chat template
+        texts = [tokenizer.apply_chat_template(conv, tokenize=False) for conv in conversations]
+
+        batch = tokenizer(
+            texts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=2048,
+        )
+        batch = {k: v.to(model.device) for k, v in batch.items()}
+
+        with torch.no_grad():
+            outputs = model(**batch)
+            # Model outputs `.logits` of shape (B, 1)
+            scores = outputs.logits.squeeze(-1).float().cpu().tolist()
+
+        return {"scores": scores}
+
+    # Launch
+    uvicorn.run(app, host=script_args.host, port=script_args.port, log_level=script_args.log_level)
+
+
 def main(script_args: ScriptArguments):
+    # ------------------------------------------------------------------
+    # Optional reward-model mode
+    # ------------------------------------------------------------------
+
+    if script_args.reward_model:
+        _run_reward_server(script_args)
+        return  # Early exit – nothing else to do
+
     if not is_fastapi_available():
         raise ImportError(
             "FastAPI is required to run the vLLM serve script. Please install it using `pip install fastapi`."
@@ -566,7 +711,7 @@ def main(script_args: ScriptArguments):
             connection.send({"type": "fire_and_forget", "method": "collective_rpc", "kwargs": kwargs})
         return {"message": "Request received, closing communicator"}
 
-    # Start the server
+    # Start the server (generation mode)
     uvicorn.run(app, host=script_args.host, port=script_args.port, log_level=script_args.log_level)
 
 

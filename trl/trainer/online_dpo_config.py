@@ -92,20 +92,32 @@ class OnlineDPOConfig(TrainingArguments):
         },
     )
     max_new_tokens: int = field(
-        default=64,
+        default=2048,
         metadata={"help": "Maximum number of tokens to generate per completion."},
     )
     max_length: int = field(
-        default=512,
+        default=4096,
         metadata={
             "help": "Maximum total length of the sequence (prompt + completion) used to compute log probabilities. If "
             "the sequence exceeds this limit, the leftmost tokens will be truncated to preserve as much of the "
             "completion as possible."
         },
     )
+    max_grad_norm: float = field(
+        default=None,
+        metadata={"help": "Maximum gradient norm for gradient clipping."},
+    )
     temperature: float = field(
-        default=0.9,
+        default=0.7,
         metadata={"help": "Temperature for sampling. The higher the temperature, the more random the completions."},
+    )
+    top_k: int = field(
+        default=None,
+        metadata={"help": "Top-k for sampling. The higher the top-k, the more random the completions."},
+    )
+    top_p: float = field(
+        default=0.95,
+        metadata={"help": "Top-p for sampling. The higher the top-p, the more random the completions."},    
     )
     missing_eos_penalty: Optional[float] = field(
         default=None,
@@ -147,9 +159,9 @@ class OnlineDPOConfig(TrainingArguments):
         },
     )
     gpu_memory_utilization: Optional[float] = field(
-        default=0.55,
+        default=0.8,
         metadata={
-            "help": "The vLLM memory utilization. The default value is 0.55.",
+            "help": "The vLLM memory utilization. The default value is 0.8.",
         },
     )
     ds3_gather_for_generation: bool = field(
@@ -158,6 +170,12 @@ class OnlineDPOConfig(TrainingArguments):
             "help": "This setting applies to DeepSpeed ZeRO-3. If enabled, the policy model weights are gathered for "
             "generation, improving generation speed. However, disabling this option allows training models that "
             "exceed the VRAM capacity of a single GPU, albeit at the cost of slower generation."
+        },
+    )
+    num_generations: int = field(
+        default=2,
+        metadata={
+            "help": "Number of generations to sample for each prompt."
         },
     )
     humanline: Optional[bool] = field(
@@ -182,6 +200,18 @@ class OnlineDPOConfig(TrainingArguments):
         default=1.5,
         metadata={
             "help": "humanline upper bound"
+        },
+    )
+    sync_reference: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to sync the reference model with the policy model at specified intervals"
+        },
+    )
+    sync_reference_steps: int = field(
+        default=100,
+        metadata={
+            "help": "Number of training steps between reference model syncs (only used if sync_reference=True)"
         },
     )
 

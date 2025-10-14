@@ -20,7 +20,7 @@ from typing import Optional
 import torch
 from torch import nn
 
-from ..import_utils import is_requests_available, is_vllm_ascend_available, is_vllm_available
+from trl.import_utils import is_requests_available, is_vllm_ascend_available, is_vllm_available
 
 
 if is_requests_available():
@@ -84,7 +84,7 @@ class VLLMClient:
     """
 
     def __init__(
-        self, host: str = "0.0.0.0", server_port: int = 8000, group_port: int = 51216, connection_timeout: float = 0.0
+        self, host: str = "127.0.0.1", server_port: int = 8000, group_port: int = 51216, connection_timeout: float = 0.0
     ):
         if not is_requests_available():
             raise ImportError("requests is not installed. Please install it with `pip install requests`.")
