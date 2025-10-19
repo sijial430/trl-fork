@@ -1,0 +1,56 @@
+diff --git a/trl/trainer/dpo_config.py b/trl/trainer/dpo_config.py
+index 857e7d38..b617f9fa 100644
+--- a/trl/trainer/dpo_config.py
++++ b/trl/trainer/dpo_config.py
+@@ -406,15 +406,21 @@ class DPOConfig(TrainingArguments):
+             "help": "Whether to use humanline"
+         },
+     )
+-    log_epsilon_P: Optional[float] = field(
++    humanline_log_epsilon_P: Optional[float] = field(
+         default=-1.5,
+         metadata={
+             "help": "humanline lower bound"
+         },
+     )
+-    log_epsilon_R: Optional[float] = field(
++    humanline_log_epsilon_R: Optional[float] = field(
+         default=1.5,
+         metadata={
+             "help": "humanline upper bound"
+         },
++    )
++    humanline_sync_freq: int = field(
++        default=1,
++        metadata={
++            "help": "how frequently to do humanline syncing"
++        },
+     )
+\ No newline at end of file
+diff --git a/trl/trainer/dpo_trainer.py b/trl/trainer/dpo_trainer.py
+index 095b3395..ec4a0688 100644
+--- a/trl/trainer/dpo_trainer.py
++++ b/trl/trainer/dpo_trainer.py
+@@ -1642,3 +1642,21 @@ class DPOTrainer(Trainer):
+         )
+ 
+         model_card.save(os.path.join(self.args.output_dir, "README.md"))
++
++
++class FixZero3CheckpointDPOTrainer(DPOTrainer):
++
++    def save_model(self, output_dir: Optional[str] = None, _internal_call: bool = False):
++        backup_model = self.model
++        self.model = self.model.policy  # save only the policy
++
++        Trainer.save_model(self, output_dir, _internal_call)
++
++        self.model = backup_model
++
++    def _save(self, output_dir: Optional[str] = None, state_dict=None):
++        if self.is_deepspeed_enabled:
++            state_dict = {name.removeprefix('policy.'): param for name, param in state_dict.items()
++                          if name.startswith('policy.')}
++
++        super()._save(output_dir, state_dict)
+\ No newline at end of file

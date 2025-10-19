@@ -406,15 +406,21 @@ class DPOConfig(TrainingArguments):
             "help": "Whether to use humanline"
         },
     )
-    log_epsilon_P: Optional[float] = field(
+    humanline_log_epsilon_P: Optional[float] = field(
         default=-1.5,
         metadata={
             "help": "humanline lower bound"
         },
     )
-    log_epsilon_R: Optional[float] = field(
+    humanline_log_epsilon_R: Optional[float] = field(
         default=1.5,
         metadata={
             "help": "humanline upper bound"
+        },
+    )
+    humanline_sync_freq: int = field(
+        default=1,
+        metadata={
+            "help": "how frequently to do humanline syncing"
         },
     )

@@ -1642,3 +1642,21 @@ class DPOTrainer(Trainer):
         )
 
         model_card.save(os.path.join(self.args.output_dir, "README.md"))
+
+
+class FixZero3CheckpointDPOTrainer(DPOTrainer):
+
+    def save_model(self, output_dir: Optional[str] = None, _internal_call: bool = False):
+        backup_model = self.model
+        self.model = self.model.policy  # save only the policy
+
+        Trainer.save_model(self, output_dir, _internal_call)
+
+        self.model = backup_model
+
+    def _save(self, output_dir: Optional[str] = None, state_dict=None):
+        if self.is_deepspeed_enabled:
+            state_dict = {name.removeprefix('policy.'): param for name, param in state_dict.items()
+                          if name.startswith('policy.')}
+
+        super()._save(output_dir, state_dict)
