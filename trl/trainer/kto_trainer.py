@@ -997,6 +997,7 @@ class KTOTrainer(BaseTrainer):
             average_log_prob=False,
             is_encoder_decoder=self.is_encoder_decoder,
             label_pad_token_id=self.label_pad_token_id,
+            humanline=self.humanline,
         )
 
         if self.calculate_KL:
@@ -1006,19 +1007,21 @@ class KTOTrainer(BaseTrainer):
                 average_log_prob=False,
                 is_encoder_decoder=self.is_encoder_decoder,
                 label_pad_token_id=self.label_pad_token_id,
+                humanline=self.humanline,
             )
         else:
             KL_logps = None
 
         return completion_logps, KL_logps
 
+    @staticmethod
     def get_batch_logps(
-        self,
         logits: torch.FloatTensor,
         labels: torch.LongTensor,
         average_log_prob: bool = False,
         label_pad_token_id: int = -100,
         is_encoder_decoder: bool = False,
+        humanline: bool = False,
     ) -> torch.FloatTensor:
         """Compute the log probabilities of the given labels under the given logits.
 
@@ -1039,8 +1042,7 @@ class KTOTrainer(BaseTrainer):
                 position, and the logits are assumed to be aligned with the shifted labels.
 
         Returns:
-            A tensor of shape (batch_size,) containing the average/sum log probabilities of the given labels under the
-            given logits.
+            A tensor of shape (batch_size,) containing the average/sum log probabilities of the given labels under the given logits.
         """
         if logits.shape[:-1] != labels.shape:
             raise ValueError("Logits (batch and sequence length dim) and labels must have the same shape.")
@@ -1059,7 +1061,7 @@ class KTOTrainer(BaseTrainer):
 
         per_token_logps = selective_log_softmax(logits, labels)
 
-        if self.humanline:
+        if humanline:
             return (per_token_logps * loss_mask)
         elif average_log_prob:
             return (per_token_logps * loss_mask).sum(-1) / loss_mask.sum(-1)
@@ -1095,6 +1097,7 @@ class KTOTrainer(BaseTrainer):
             average_log_prob=False,
             is_encoder_decoder=self.is_encoder_decoder,
             label_pad_token_id=self.label_pad_token_id,
+            humanline=self.humanline,
         )
 
         if completion_logps.shape[0] != len(batch["label"]):
@@ -1149,9 +1152,9 @@ class KTOTrainer(BaseTrainer):
         """
         if self.calculate_KL:
             if self.humanline:
-                policy_KL_logps.clamp_(min=self.humanline_log_eps_P, max=self.humanline_log_eps_R)
-                reference_KL_logps.clamp_(min=self.humanline_log_eps_P, max=self.humanline_log_eps_R)
-            kl = (policy_KL_logps - reference_KL_logps).sum(-1).mean().detach()
+                kl = (policy_KL_logps - reference_KL_logps).clamp_(min=self.humanline_log_eps_P, max=self.humanline_log_eps_R).sum(-1).mean().detach()
+            else:
+                kl = (policy_KL_logps - reference_KL_logps).sum(-1).mean().detach()
             kl = self.accelerator.gather_for_metrics(kl).mean().clamp(min=0)
         else:
             kl = torch.zeros(1).to(policy_chosen_logps.device)
@@ -1231,6 +1234,7 @@ class KTOTrainer(BaseTrainer):
                 average_log_prob=False,
                 is_encoder_decoder=self.is_encoder_decoder,
                 label_pad_token_id=self.label_pad_token_id,
+                humanline=self.humanline,
             )
         return KL_logps
 

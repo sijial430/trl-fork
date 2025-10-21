@@ -330,7 +330,12 @@ def unpair_preference_dataset(
     {'prompt': 'The sky is', 'completion': ' blue.', 'label': True}
     ```
     """
-    return dataset.map(_unpair_row, batched=True, remove_columns=["chosen", "rejected"], num_proc=num_proc, desc=desc)
+    # Get all columns to remove (everything except what we'll create in _unpair_row)
+    if isinstance(dataset, dict):
+        columns_to_remove = list(dataset[list(dataset.keys())[0]].column_names)
+    else:
+        columns_to_remove = list(dataset.column_names)
+    return dataset.map(_unpair_row, batched=True, remove_columns=columns_to_remove, num_proc=num_proc, desc=desc)
 
 
 def maybe_unpair_preference_dataset(
