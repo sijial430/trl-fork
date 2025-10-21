@@ -164,6 +164,11 @@ class HumanlineSyncRefModelCallback(TrainerCallback):
             return
         if (state.global_step + 1) % args.humanline_sync_freq == 0:
             model: PreTrainedModel = kwargs["model"]
+            # Set stage3_gather_16bit_weights_on_model_save to True to save the model weights in 16bit.
+            # This is necessary for humanline syncing to work correctly.
+            if self.accelerator.state.deepspeed_plugin.zero_stage == 3:
+                if not getattr(self.accelerator.state.deepspeed_plugin, "stage3_gather_16bit_weights_on_model_save", False):
+                    self.accelerator.state.deepspeed_plugin.stage3_gather_16bit_weights_on_model_save = True
             self.policy_state_dict = self.accelerator.get_state_dict(model)
 
     def on_step_end(self, args, state, control, **kwargs):

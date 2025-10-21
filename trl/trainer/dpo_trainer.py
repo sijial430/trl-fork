@@ -1071,10 +1071,13 @@ class DPOTrainer(BaseTrainer):
         # Get the log ratios for the chosen and rejected responses
         chosen_logratios = chosen_logps.to(device) - (not self.reference_free) * ref_chosen_logps.to(device)
         rejected_logratios = rejected_logps.to(device) - (not self.reference_free) * ref_rejected_logps.to(device)
-
+        
         if self.humanline:
-            chosen_logratios.clamp_(min=self.humanline_log_eps_P, max=self.humanline_log_eps_R)
-            rejected_logratios.clamp_(min=self.humanline_log_eps_P, max=self.humanline_log_eps_R)
+            # Humanline clipping is applied to the token-level log ratios of the chosen and rejected responses.
+            # The log ratios are then summed to the sequence level to get the final log ratios before calculating the logits.
+            # Shape: (batch_size, sequence_length) -> (batch_size,)
+            chosen_logratios = chosen_logratios.clamp_(min=self.humanline_log_eps_P, max=self.humanline_log_eps_R).sum(-1)
+            rejected_logratios = rejected_logratios.clamp_(min=self.humanline_log_eps_P, max=self.humanline_log_eps_R).sum(-1)
 
         if self.f_divergence_type == FDivergenceType.ALPHA_DIVERGENCE:
             # The alpha-divergence formula: (1 - u^-alpha) / alpha
@@ -1096,6 +1099,11 @@ class DPOTrainer(BaseTrainer):
 
             logratios = logratios.to(self.accelerator.device)
             ref_logratios = ref_logratios.to(self.accelerator.device)
+            if self.humanline:
+                # For non-F-divergence variants of DPO, humanline clipping is applied to the token-level log ratios in a similar way as above.
+                # Shape: (batch_size, sequence_length) -> (batch_size,)
+                logratios = logratios.clamp_(min=self.humanline_log_eps_P, max=self.humanline_log_eps_R).sum(-1)
+                ref_logratios = ref_logratios.clamp_(min=self.humanline_log_eps_P, max=self.humanline_log_eps_R).sum(-1)
             logits = logratios - ref_logratios
 
             if self.f_divergence_type == FDivergenceType.JS_DIVERGENCE:
@@ -1142,6 +1150,10 @@ class DPOTrainer(BaseTrainer):
         elif loss_type == "bco_pair":
             chosen_logratios = chosen_logps - ref_chosen_logps
             rejected_logratios = rejected_logps - ref_rejected_logps
+            if self.humanline:
+                # Applying humanline clipping to the token-level log ratios for 'bco_pair' loss.
+                chosen_logratios = chosen_logratios.clamp_(min=self.humanline_log_eps_P, max=self.humanline_log_eps_R).sum(-1)
+                rejected_logratios = rejected_logratios.clamp_(min=self.humanline_log_eps_P, max=self.humanline_log_eps_R).sum(-1)
             chosen_rewards = self.beta * chosen_logratios
             rejected_rewards = self.beta * rejected_logratios
             rewards = torch.cat((chosen_rewards, rejected_rewards), 0).mean().detach()
@@ -1158,11 +1170,19 @@ class DPOTrainer(BaseTrainer):
             # set to 1 for the winner and 0 for the loser.
             a = chosen_logps - ref_chosen_logps
             b = rejected_logps - ref_rejected_logps
+            if self.humanline:
+                # Applying humanline clipping to the token-level log ratios for 'sppo_hard' loss.
+                a = a.clamp_(min=self.humanline_log_eps_P, max=self.humanline_log_eps_R).sum(-1)
+                b = b.clamp_(min=self.humanline_log_eps_P, max=self.humanline_log_eps_R).sum(-1)
             losses = (a - 0.5 / self.beta) ** 2 + (b + 0.5 / self.beta) ** 2
 
         elif loss_type == "nca_pair":
             chosen_rewards = (chosen_logps - ref_chosen_logps) * self.beta
             rejected_rewards = (rejected_logps - ref_rejected_logps) * self.beta
+            if self.humanline:
+                # Applying humanline clipping to the token-level log ratios for 'nca_pair' loss.
+                chosen_rewards = chosen_rewards.clamp_(min=self.humanline_log_eps_P, max=self.humanline_log_eps_R).sum(-1)
+                rejected_rewards = rejected_rewards.clamp_(min=self.humanline_log_eps_P, max=self.humanline_log_eps_R).sum(-1)
             losses = (
                 -F.logsigmoid(chosen_rewards)
                 - 0.5 * F.logsigmoid(-chosen_rewards)
@@ -1172,6 +1192,10 @@ class DPOTrainer(BaseTrainer):
         elif loss_type == "aot_pair":
             chosen_logratios = chosen_logps - ref_chosen_logps
             rejected_logratios = rejected_logps - ref_rejected_logps
+            if self.humanline:
+                # Applying humanline clipping to the token-level log ratios for 'aot_pair' loss.
+                chosen_logratios = chosen_logratios.clamp_(min=self.humanline_log_eps_P, max=self.humanline_log_eps_R).sum(-1)
+                rejected_logratios = rejected_logratios.clamp_(min=self.humanline_log_eps_P, max=self.humanline_log_eps_R).sum(-1)
             chosen_logratios_sorted, _ = torch.sort(chosen_logratios, dim=0)
             rejected_logratios_sorted, _ = torch.sort(rejected_logratios, dim=0)
             delta = chosen_logratios_sorted - rejected_logratios_sorted
@@ -1183,6 +1207,10 @@ class DPOTrainer(BaseTrainer):
         elif loss_type == "aot":
             logratios = chosen_logps - rejected_logps
             ref_logratios = ref_chosen_logps - ref_rejected_logps
+            if self.humanline:
+                # Applying humanline clipping to the token-level log ratios for 'aot' loss.
+                logratios = logratios.clamp_(min=self.humanline_log_eps_P, max=self.humanline_log_eps_R).sum(-1)
+                ref_logratios = ref_logratios.clamp_(min=self.humanline_log_eps_P, max=self.humanline_log_eps_R).sum(-1)
             logratios_sorted, _ = torch.sort(logratios, dim=0)
             ref_logratios_sorted, _ = torch.sort(ref_logratios, dim=0)
             delta = logratios_sorted - ref_logratios_sorted
@@ -1211,6 +1239,10 @@ class DPOTrainer(BaseTrainer):
             # This loss was discovered with LLM discovery
             logratios = chosen_logps - rejected_logps
             ref_logratios = ref_chosen_logps - ref_rejected_logps
+            if self.humanline:
+                # Applying humanline clipping to the token-level log ratios for 'discopop' loss.
+                logratios = logratios.clamp_(min=self.humanline_log_eps_P, max=self.humanline_log_eps_R).sum(-1)
+                ref_logratios = ref_logratios.clamp_(min=self.humanline_log_eps_P, max=self.humanline_log_eps_R).sum(-1)
             logits = logratios - ref_logratios
             logits = logits * self.beta
             # Modulate the mixing coefficient based on the log ratio magnitudes
@@ -1733,16 +1765,16 @@ class DPOTrainer(BaseTrainer):
             for idx, loss_type in enumerate(self.loss_type):
                 # Compute individual loss using standard DPO loss function
                 if self.humanline:
-                    _losses, _per_token_chosen_rewards, _per_token_rejected_rewards = self.dpo_loss(
-                        model_output["per_token_chosen_logps"], 
-                        model_output["per_token_rejected_logps"], 
-                        ref_per_token_chosen_logps, 
-                        ref_per_token_rejected_logps, 
+                    # Using the token-level log probabilities for the humanline variant.
+                    # Returned chosen and rejected rewards are already summed to get the sequence-level rewards.
+                    _losses, _chosen_rewards, _rejected_rewards = self.dpo_loss(
+                        model_output["per_token_chosen_logps"],
+                        model_output["per_token_rejected_logps"],
+                        ref_per_token_chosen_logps,
+                        ref_per_token_rejected_logps,
                         loss_type,
                         model_output,
                     )
-                    _chosen_rewards = _per_token_chosen_rewards.sum(dim=1)
-                    _rejected_rewards = _per_token_rejected_rewards.sum(dim=1)
                 else:
                     _losses, _chosen_rewards, _rejected_rewards = self.dpo_loss(
                         model_output["chosen_logps"],

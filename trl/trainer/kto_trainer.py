@@ -1052,6 +1052,7 @@ class KTOTrainer(BaseTrainer):
 
         Returns:
             A tensor of shape (batch_size,) containing the average/sum log probabilities of the given labels under the given logits.
+            If humanline is True, a tensor of shape (batch_size, sequence_length) containing the token-level log probabilities of the given labels under the given logits is returned.
         """
         if logits.shape[:-1] != labels.shape:
             raise ValueError("Logits (batch and sequence length dim) and labels must have the same shape.")
@@ -1161,6 +1162,8 @@ class KTOTrainer(BaseTrainer):
         """
         if self.calculate_KL:
             if self.humanline:
+                # For KTO, humanline clipping is also applied to the token-level log ratios in the KL term.
+                # Shape: (batch_size, sequence_length) -> (batch_size,)
                 kl = (policy_KL_logps - reference_KL_logps).clamp_(min=self.humanline_log_eps_P, max=self.humanline_log_eps_R).sum(-1).mean().detach()
             else:
                 kl = (policy_KL_logps - reference_KL_logps).sum(-1).mean().detach()
@@ -1173,8 +1176,8 @@ class KTOTrainer(BaseTrainer):
             chosen_logratios = policy_chosen_logps - reference_chosen_logps
 
             if self.humanline:
-                chosen_logratios.clamp_(min=self.humanline_log_eps_P, max=self.humanline_log_eps_R)
-                chosen_logratios = chosen_logratios.sum(-1)
+                # Humanline clipping is applied to the token-level log ratios in the chosen responses.
+                chosen_logratios = chosen_logratios.clamp_(min=self.humanline_log_eps_P, max=self.humanline_log_eps_R).sum(-1)
 
             if self.loss_type == "kto":
                 # Eqn (7) of the KTO paper (https://huggingface.co/papers/2402.01306)
@@ -1196,8 +1199,8 @@ class KTOTrainer(BaseTrainer):
             rejected_logratios = policy_rejected_logps - reference_rejected_logps
 
             if self.humanline:
-                rejected_logratios.clamp_(min=self.humanline_log_eps_P, max=self.humanline_log_eps_R)
-                rejected_logratios = rejected_logratios.sum(-1)
+                # Humanline clipping is applied to the token-level log ratios in the chosen responses.
+                rejected_logratios = rejected_logratios.clamp_(min=self.humanline_log_eps_P, max=self.humanline_log_eps_R).sum(-1)
 
             if self.loss_type == "kto":
                 rejected_losses = 1 - F.sigmoid(self.beta * (kl - rejected_logratios))
